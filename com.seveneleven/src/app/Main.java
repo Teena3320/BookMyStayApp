@@ -2,35 +2,43 @@ package app;
 
 import model.InventorySnapshot;
 import model.RoomView;
+import model.ReservationRequest;
+import services.BookingQueueService;
 import services.InventoryService;
 import services.SearchService;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.InputMismatchException;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
 
 /**
- * Use Case 2: Room Search & Availability Check
- * - Read-only access to room inventory using defensive snapshots.
- * - Fast lookups using HashMap for counts and prices.
- * - Ensures no mutation during search for data consistency.
- * - Returns only room types with positive availability.
- * - Provides structured room views (RoomView) for UI/CLI display.
+ * Use Case 3: Booking Request (First-Come-First-Served)
+ * - Captures guest booking intentions without modifying inventory.
+ * - Uses a FIFO queue to ensure fair and predictable processing order.
+ * - Prevents race conditions during high‑traffic booking scenarios.
+ * - Stores each request with timestamp metadata for strict chronological ordering.
+ * - Allocation and room assignment are handled later in Use Case 4.
  */
+
 public class Main {
 
     private static final Scanner SC = new Scanner(System.in);
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ISO_LOCAL_DATE;
 
     public static void main(String[] args) {
         InventoryService inventory = new InventoryService();
         SearchService search = new SearchService(inventory);
+        BookingQueueService bookingQueue = new BookingQueueService();
         seedDefaults(inventory); // optional seeding
 
         boolean running = true;
         while (running) {
             printMenu();
-            int choice = readInt("Choose an option (1-10): ");
+            int choice = readInt("Choose an option (1-12): ");
             switch (choice) {
                 case 1:
                     addRoomType(inventory);
@@ -51,19 +59,25 @@ public class Main {
                     viewSnapshot(inventory);
                     break;
                 case 7:
-                    getCount(inventory);   
+                    getCount(inventory);
                     break;
                 case 8:
-                    getPrice(inventory);  
+                    getPrice(inventory);
                     break;
                 case 9:
-                    listAvailableRooms(search); 
+                    listAvailableRooms(search);
                     break;
                 case 10:
-                    running = false;       
+                    submitBookingRequest(inventory, bookingQueue);
+                    break;
+                case 11:
+                    viewPendingRequests(bookingQueue);
+                    break;
+                case 12:
+                    running = false; // Exit
                     break;
                 default:
-                    System.out.println("Invalid option. Please choose between 1 and 10.");
+                    System.out.println("Invalid option. Please choose between 1 and 12.");
             }
             if (running) {
                 System.out.println("\nPress ENTER to continue...");
@@ -74,17 +88,89 @@ public class Main {
     }
 
     private static void printMenu() {
-        System.out.println("\n=== BookMyStay Inventory & Search ===");
-        System.out.println("1) Add Room Type");
-        System.out.println("2) Update Count (±delta)");
-        System.out.println("3) Update Price");
-        System.out.println("4) View All Counts");
-        System.out.println("5) View All Prices");
-        System.out.println("6) View Full Snapshot");
-        System.out.println("7) Get Count by Room Type (enter room type name, e.g., Single)");
-        System.out.println("8) Get Price by Room Type (enter room type name, e.g., Single)");
-        System.out.println("9) Search Available Rooms ");
-        System.out.println("10) Exit");
+        System.out.println("\n=== BookMyStay Inventory, Search & Booking Queue ===");
+        System.out.println("1)  Add Room Type");
+        System.out.println("2)  Update Count (±delta)");
+        System.out.println("3)  Update Price");
+        System.out.println("4)  View All Counts");
+        System.out.println("5)  View All Prices");
+        System.out.println("6)  View Full Snapshot");
+        System.out.println("7)  Get Count by Room Type");
+        System.out.println("8)  Get Price by Room Type");
+        System.out.println("9)  Search Available Rooms ");
+        System.out.println("10) Submit Booking Request ");
+        System.out.println("11) View Pending Booking Requests ");
+        System.out.println("12) Exit");
+    }
+
+    // --- UC3 actions ---
+
+    private static void submitBookingRequest(InventoryService inventory, BookingQueueService bookingQueue) {
+        String guest = readString("Enter guest name or ID: ");
+        String roomType = readString("Enter desired room type (e.g., Single): ");
+        if (!inventory.hasRoomType(roomType)) {
+            System.out.println("Error: Unknown room type '" + roomType + "'. Please add it first (option 1).");
+            return;
+        }
+        LocalDate checkIn = readDate("Enter check-in date (YYYY-MM-DD): ");
+        LocalDate checkOut = readDate("Enter check-out date (YYYY-MM-DD): ");
+        try {
+            ReservationRequest req = new ReservationRequest.Builder()
+                    .guestIdOrName(guest)
+                    .roomType(roomType)
+                    .checkIn(checkIn)
+                    .checkOut(checkOut)
+                    .build();
+            bookingQueue.submit(req);
+            System.out.println("Request submitted in FIFO order. ID: " + req.getRequestId() +
+                    " | SubmittedAt: " + req.getSubmittedAt());
+        } catch (IllegalArgumentException ex) {
+            System.out.println("Error: " + ex.getMessage());
+        }
+    }
+
+    private static void viewPendingRequests(BookingQueueService bookingQueue) {
+        List<ReservationRequest> pending = bookingQueue.snapshotPending();
+        System.out.println("\n-- Pending Booking Requests (FIFO) --");
+        if (pending.isEmpty()) {
+            System.out.println("  (none)");
+            return;
+        }
+        System.out.printf("%-12s | %-15s | %-10s | %-10s | %-24s%n",
+                "RequestID", "Guest", "RoomType", "CheckIn", "SubmittedAt");
+        System.out.println("------------+-----------------+------------+------------+--------------------------");
+        for (ReservationRequest r : pending) {
+            System.out.printf("%-12s | %-15s | %-10s | %-10s | %-24s%n",
+                    r.getRequestId(),
+                    truncate(r.getGuestIdOrName(), 15),
+                    r.getRoomType(),
+                    r.getCheckIn(),
+                    r.getSubmittedAt());
+        }
+        System.out.println("Total pending: " + bookingQueue.size());
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        if (s.length() <= max) return s;
+        return s.substring(0, max - 1) + "…";
+    }
+
+    // --- UC2 actions ---
+
+    private static void listAvailableRooms(SearchService search) {
+        System.out.println("\n-- Available Rooms (count > 0) --");
+        List<RoomView> views = search.listAvailableRooms();
+        if (views.isEmpty()) {
+            System.out.println("  No rooms currently available.");
+            return;
+        }
+        System.out.printf("  %-12s | %-6s | %-10s%n", "RoomType", "Count", "Price");
+        System.out.println("  -------------+--------+------------");
+        for (RoomView v : views) {
+            System.out.printf("  %-12s | %-6d | %-10.2f%n",
+                    v.getRoomType(), v.getAvailableCount(), v.getPricePerNight());
+        }
     }
 
     // --- UC1 actions ---
@@ -189,35 +275,6 @@ public class Main {
         }
     }
 
-    // --- UC2 action ---
-
-    private static void listAvailableRooms(SearchService search) {
-        System.out.println("\n-- Available Rooms (count > 0) --");
-        List<RoomView> views = search.listAvailableRooms();
-        if (views.isEmpty()) {
-            System.out.println("  No rooms currently available.");
-            return;
-        }
-        System.out.printf("  %-12s | %-6s | %-10s%n", "RoomType", "Count", "Price");
-        System.out.println("  -------------+--------+------------");
-        for (RoomView v : views) {
-            System.out.printf("  %-12s | %-6d | %-10.2f%n",
-                    v.getRoomType(), v.getAvailableCount(), v.getPricePerNight());
-        }
-    }
-
-    private static void seedDefaults(InventoryService inventory) {
-        try {
-            inventory.addRoomType("Single", 10, 2999.00);
-        } catch (IllegalArgumentException ignored) {}
-        try {
-            inventory.addRoomType("Double", 8, 4599.50);
-        } catch (IllegalArgumentException ignored) {}
-        try {
-            inventory.addRoomType("Suite", 3, 11999.00);
-        } catch (IllegalArgumentException ignored) {}
-    }
-
     // --- Input helpers ---
 
     private static String readString(String prompt) {
@@ -252,5 +309,29 @@ public class Main {
                 System.out.println("Please enter a valid number.");
             }
         }
+    }
+
+    private static LocalDate readDate(String prompt) {
+        while (true) {
+            System.out.print(prompt);
+            String line = SC.nextLine();
+            try {
+                return LocalDate.parse(line.trim(), DATE_FMT);
+            } catch (DateTimeParseException ex) {
+                System.out.println("Please enter a valid date in YYYY-MM-DD format.");
+            }
+        }
+    }
+
+    private static void seedDefaults(InventoryService inventory) {
+        try {
+            inventory.addRoomType("Single", 10, 2999.00);
+        } catch (IllegalArgumentException ignored) {}
+        try {
+            inventory.addRoomType("Double", 8, 4599.50);
+        } catch (IllegalArgumentException ignored) {}
+        try {
+            inventory.addRoomType("Suite", 3, 11999.00);
+        } catch (IllegalArgumentException ignored) {}
     }
 }
