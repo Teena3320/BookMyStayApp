@@ -10,12 +10,14 @@ import java.util.concurrent.locks.ReentrantLock;
 
 public class BookingService {
 
+    // ----- UC4 state -----
     private final Set<String> assignedRoomIds = new HashSet<>();
     private final Map<String, Set<String>> typeToAssignedRooms = new HashMap<>();
     private final Map<String, Integer> typeSequence = new HashMap<>();
     private final List<Reservation> confirmed = new ArrayList<>();
 
     private final ReentrantLock allocationLock = new ReentrantLock();
+
     public Reservation confirmNext(BookingQueueService queue, InventoryService inventory) {
         Objects.requireNonNull(queue, "queue");
         Objects.requireNonNull(inventory, "inventory");
@@ -36,18 +38,16 @@ public class BookingService {
             }
 
             ReservationRequest req = queue.pollNext();
-            if (req == null) return null;
+            if (req == null) return null; // race: queue emptied
 
             boolean reserved = inventory.reserveDates(req.getRoomType(), req.getCheckIn(), req.getCheckOut());
             if (!reserved) {
                 return null;
             }
 
-            // Generate unique room ID
             String roomId = generateUniqueRoomId(req.getRoomType());
             markAssigned(req.getRoomType(), roomId);
 
-            // Pricing snapshot
             double pricePerNight = inventory.getPrice(req.getRoomType());
             int nights = (int) Math.max(1, ChronoUnit.DAYS.between(req.getCheckIn(), req.getCheckOut()));
             double total = pricePerNight * nights;
@@ -72,6 +72,23 @@ public class BookingService {
             allocationLock.unlock();
         }
     }
+
+    public List<Reservation> listConfirmed() {
+        return Collections.unmodifiableList(confirmed);
+    }
+
+    public Optional<Reservation> findConfirmedById(String reservationId) {
+        if (reservationId == null || reservationId.trim().isEmpty()) return Optional.empty();
+        String key = reservationId.trim();
+        for (Reservation r : confirmed) {
+            if (key.equals(r.getReservationId())) {
+                return Optional.of(r);
+            }
+        }
+        return Optional.empty();
+    }
+
+    // ----- helpers -----
 
     private Reservation buildRejected(ReservationRequest req, String reason) {
         return new Reservation.Builder()
@@ -102,13 +119,5 @@ public class BookingService {
     private void markAssigned(String roomType, String roomId) {
         assignedRoomIds.add(roomId);
         typeToAssignedRooms.computeIfAbsent(roomType, k -> new HashSet<>()).add(roomId);
-    }
-
-    public List<Reservation> listConfirmed() {
-        return Collections.unmodifiableList(confirmed);
-    }
-
-    public boolean isRoomIdAssigned(String roomId) {
-        return assignedRoomIds.contains(roomId);
     }
 }
