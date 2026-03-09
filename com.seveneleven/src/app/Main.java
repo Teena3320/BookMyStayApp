@@ -1,4 +1,3 @@
-// src/main/java/com/bookmystay/app/Main.java
 package app;
 
 import model.InventorySnapshot;
@@ -18,17 +17,14 @@ import java.util.Optional;
 import java.util.Scanner;
 
 /**
- * Use Case 5: Add‑On Service Selection
- * - Allows guests to enhance their confirmed reservation with optional services 
- *   such as breakfast, airport pickup, spa, extra bed, etc.
- * - Maintains a one‑to‑many relationship: one reservation can have multiple services.
- * - Uses a centralized Service Catalog to provide valid service codes, names, and pricing.
- * - Stores services per reservation in a thread‑safe map (reservationId → List<ServiceItem>).
- * - Computes total additional charges for all attached services for billing and reporting.
- * - Ensures immutability of ServiceItem objects and provides read‑only snapshots for safety.
- * - Integrates with UC4 by requiring a valid Reservation ID (only confirmed bookings can add services).
+ * Use Case 6: Booking History & Reporting
+ * - Maintains a complete audit trail of all reservations, including confirmed and cancelled ones.
+ * - Supports cancellation by releasing previously reserved dates back into inventory while preserving historical records.
+ * - Provides reporting utilities for active bookings, cancelled bookings, and guest-specific search.
+ * - Computes time‑bounded revenue reports by analyzing overlapping stays within a given date range.
+ * - Ensures all returned data is read‑only (defensive copies / unmodifiable views) for safe consumption.
+ * - Integrates seamlessly with UC4 reservation data and UC5 billing to deliver analytical and operational insights.
  */
-
 public class Main {
 
     private static final Scanner SC = new Scanner(System.in);
@@ -39,6 +35,7 @@ public class Main {
         SearchService search = new SearchService(inventory);
         BookingQueueService bookingQueue = new BookingQueueService();
         BookingService bookingService = new BookingService();
+        ReportingService reports = new ReportingService(bookingService);
         ServiceCatalog catalog = new ServiceCatalog();
         ServiceManagement services = new ServiceManagement();
         seedDefaults(inventory);
@@ -46,7 +43,7 @@ public class Main {
         boolean running = true;
         while (running) {
             printMenu();
-            int choice = readInt("Choose an option (1-18): ");
+            int choice = readInt("Choose an option (1-22): ");
             switch (choice) {
                 case 1 -> addRoomType(inventory);
                 case 2 -> updateBaseCount(inventory);
@@ -65,8 +62,13 @@ public class Main {
                 case 15 -> addServiceToReservation(bookingService, catalog, services);
                 case 16 -> viewServicesForReservation(bookingService, services);
                 case 17 -> viewReservationBill(bookingService, services);
-                case 18 -> running = false;
-                default -> System.out.println("Invalid option. Please choose between 1 and 18.");
+                // ---- UC6 ----
+                case 18 -> cancelReservation(bookingService, inventory);
+                case 19 -> listActiveReservations(reports);
+                case 20 -> listCancelledReservations(reports);
+                case 21 -> reportRevenueBetween(reports);
+                case 22 -> running = false;
+                default -> System.out.println("Invalid option. Please choose between 1 and 22.");
             }
             if (running) {
                 System.out.println("\nPress ENTER to continue...");
@@ -77,7 +79,7 @@ public class Main {
     }
 
     private static void printMenu() {
-        System.out.println("\n=== BookMyStay (UC1–UC5) ===");
+        System.out.println("\n=== BookMyStay (UC1–UC6) ===");
         System.out.println("1)  Add Room Type");
         System.out.println("2)  Update Base Count (±delta)");
         System.out.println("3)  Update Price");
@@ -90,12 +92,85 @@ public class Main {
         System.out.println("10) Submit Booking Request ");
         System.out.println("11) View Pending Booking Requests");
         System.out.println("12) Confirm Next Booking ");
-        System.out.println("13) View Confirmed Reservations  ");
+        System.out.println("13) View Confirmed Reservations ");
         System.out.println("14) List Service Catalog ");
         System.out.println("15) Add Service to a Reservation ");
         System.out.println("16) View Services for a Reservation ");
         System.out.println("17) View Reservation Bill (Room + Services)");
-        System.out.println("18) Exit");
+        System.out.println("18) Cancel a Reservation ");
+        System.out.println("19) List ACTIVE Reservations ");
+        System.out.println("20) List CANCELLED Reservations ");
+        System.out.println("21) Report: Revenue Between Dates ");
+        System.out.println("22) Exit");
+    }
+
+    // ---------- UC6 actions ----------
+
+    private static void cancelReservation(BookingService bookingService, InventoryService inventory) {
+        String reservationId = readString("Enter Reservation ID to cancel: ");
+        boolean ok = bookingService.cancelReservation(reservationId, inventory);
+        if (ok) {
+            System.out.println("Reservation cancelled and dates released: " + reservationId);
+        } else {
+            System.out.println("Cancellation failed. Check the Reservation ID or it may already be cancelled.");
+        }
+    }
+
+    private static void listActiveReservations(ReportingService reports) {
+        var list = reports.listActiveReservations();
+        System.out.println("\n-- ACTIVE Reservations --");
+        if (list.isEmpty()) {
+            System.out.println("  (none)");
+            return;
+        }
+        System.out.printf("%-12s | %-12s | %-15s | %-10s | %-10s | %-8s | %-10s | %-10s%n",
+                "ReservationID", "RequestID", "Guest", "RoomType", "RoomID", "Nights", "Price/N", "Total");
+        System.out.println("------------+--------------+-----------------+------------+------------+----------+------------+------------");
+        for (Reservation r : list) {
+            System.out.printf("%-12s | %-12s | %-15s | %-10s | %-10s | %-8d | %-10.2f | %-10.2f%n",
+                    r.getReservationId(),
+                    r.getRequestId(),
+                    truncate(r.getGuestIdOrName(), 15),
+                    r.getRoomType(),
+                    r.getRoomId(),
+                    r.getNights(),
+                    r.getPricePerNight(),
+                    r.getTotalCost());
+        }
+    }
+
+    private static void listCancelledReservations(ReportingService reports) {
+        var list = reports.listCancelledReservations();
+        System.out.println("\n-- CANCELLED Reservations --");
+        if (list.isEmpty()) {
+            System.out.println("  (none)");
+            return;
+        }
+        System.out.printf("%-12s | %-12s | %-15s | %-10s | %-10s | %-8s | %-10s | %-10s%n",
+                "ReservationID", "RequestID", "Guest", "RoomType", "RoomID", "Nights", "Price/N", "Total");
+        System.out.println("------------+--------------+-----------------+------------+------------+----------+------------+------------");
+        for (Reservation r : list) {
+            System.out.printf("%-12s | %-12s | %-15s | %-10s | %-10s | %-8d | %-10.2f | %-10.2f%n",
+                    r.getReservationId(),
+                    r.getRequestId(),
+                    truncate(r.getGuestIdOrName(), 15),
+                    r.getRoomType(),
+                    r.getRoomId(),
+                    r.getNights(),
+                    r.getPricePerNight(),
+                    r.getTotalCost());
+        }
+    }
+
+    private static void reportRevenueBetween(ReportingService reports) {
+        LocalDate from = readDate("Revenue From (YYYY-MM-DD): ");
+        LocalDate to = readDate("Revenue To (YYYY-MM-DD, exclusive): ");
+        if (!to.isAfter(from)) {
+            System.out.println("End must be after start.");
+            return;
+        }
+        double revenue = reports.revenueBetween(from, to);
+        System.out.printf("Room Revenue from %s to %s : %.2f%n", from, to, revenue);
     }
 
     // ---------- UC5 actions ----------
@@ -110,7 +185,6 @@ public class Main {
             return;
         }
 
-        // Full table with CODE visible explicitly
         System.out.printf("%-20s | %-28s | %-10s%n", "Code", "Name", "Unit Price");
         System.out.println("----------------------+------------------------------+------------");
         for (String code : codeToName.keySet()) {
@@ -119,7 +193,6 @@ public class Main {
             System.out.printf("%-20s | %-28s | %-10.2f%n", code, name, price);
         }
 
-        // Copy-friendly line of codes for quick reference
         System.out.print("\nCopyable Service Codes: ");
         boolean first = true;
         for (String code : codeToName.keySet()) {
@@ -131,7 +204,7 @@ public class Main {
     }
 
     private static void addServiceToReservation(BookingService bookingService, ServiceCatalog catalog, ServiceManagement services) {
-        String reservationId = readString("Enter Reservation ID (see option 13 to list IDs): ");
+        String reservationId = readString("Enter Reservation ID (see option 13/19 to list IDs): ");
         Optional<Reservation> maybeRes = bookingService.findConfirmedById(reservationId);
         if (maybeRes.isEmpty()) {
             System.out.println("Reservation not found. Confirm a booking first.");
@@ -154,7 +227,7 @@ public class Main {
     }
 
     private static void viewServicesForReservation(BookingService bookingService, ServiceManagement services) {
-        String reservationId = readString("Enter Reservation ID (see option 13 to list IDs): ");
+        String reservationId = readString("Enter Reservation ID (see option 13/19): ");
         Optional<Reservation> maybeRes = bookingService.findConfirmedById(reservationId);
         if (maybeRes.isEmpty()) {
             System.out.println("Reservation not found.");
@@ -177,7 +250,7 @@ public class Main {
     }
 
     private static void viewReservationBill(BookingService bookingService, ServiceManagement services) {
-        String reservationId = readString("Enter Reservation ID (see option 13 to list IDs): ");
+        String reservationId = readString("Enter Reservation ID (see option 13/19): ");
         Optional<Reservation> maybeRes = bookingService.findConfirmedById(reservationId);
         if (maybeRes.isEmpty()) {
             System.out.println("Reservation not found.");
@@ -237,7 +310,7 @@ public class Main {
 
     private static void viewConfirmedReservations(BookingService bookingService) {
         List<Reservation> list = bookingService.listConfirmed();
-        System.out.println("\n-- Confirmed Reservations --");
+        System.out.println("\n-- Confirmed Reservations (includes ones later cancelled) --");
         if (list.isEmpty()) {
             System.out.println("  (none)");
             return;
@@ -284,7 +357,7 @@ public class Main {
                     .build();
             bookingQueue.submit(req);
             System.out.println("Request submitted. RequestID: " + req.getRequestId());
-            System.out.println("NOTE: After confirmation (menu 12), use menu 13 to view your Reservation ID.");
+            System.out.println("NOTE: After confirmation (menu 12), use menu 13/19 to view your Reservation ID.");
         } catch (IllegalArgumentException ex) {
             System.out.println("Error: " + ex.getMessage());
         }

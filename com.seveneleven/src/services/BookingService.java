@@ -16,6 +16,10 @@ public class BookingService {
     private final Map<String, Integer> typeSequence = new HashMap<>();
     private final List<Reservation> confirmed = new ArrayList<>();
 
+    // ----- UC6 state -----
+    private final List<Reservation> cancelled = new ArrayList<>();
+    private final Set<String> cancelledIds = new HashSet<>();
+
     private final ReentrantLock allocationLock = new ReentrantLock();
 
     public Reservation confirmNext(BookingQueueService queue, InventoryService inventory) {
@@ -73,8 +77,59 @@ public class BookingService {
         }
     }
 
+    public boolean cancelReservation(String reservationId, InventoryService inventory) {
+        Objects.requireNonNull(inventory, "inventory");
+        if (reservationId == null || reservationId.trim().isEmpty()) return false;
+        String key = reservationId.trim();
+
+        allocationLock.lock();
+        try {
+            if (cancelledIds.contains(key)) return false; // already cancelled
+
+            Reservation res = null;
+            for (Reservation r : confirmed) {
+                if (key.equals(r.getReservationId())) {
+                    res = r;
+                    break;
+                }
+            }
+            if (res == null) return false;
+
+            inventory.releaseDates(res.getRoomType(), res.getCheckIn(), res.getCheckOut());
+
+            Reservation cancelledCopy = new Reservation.Builder()
+                    .reservationId(res.getReservationId())
+                    .requestId(res.getRequestId())
+                    .guestIdOrName(res.getGuestIdOrName())
+                    .roomType(res.getRoomType())
+                    .roomId(res.getRoomId())
+                    .checkIn(res.getCheckIn())
+                    .checkOut(res.getCheckOut())
+                    .nights(res.getNights())
+                    .pricePerNight(res.getPricePerNight())
+                    .totalCost(res.getTotalCost())
+                    .status(ReservationStatus.CANCELLED)
+                    .build();
+
+            cancelled.add(cancelledCopy);
+            cancelledIds.add(key);
+            return true;
+
+        } finally {
+            allocationLock.unlock();
+        }
+    }
+
     public List<Reservation> listConfirmed() {
         return Collections.unmodifiableList(confirmed);
+    }
+
+    public List<Reservation> listCancelled() {
+        return Collections.unmodifiableList(cancelled);
+    }
+
+    public Set<String> cancelledIdsSnapshot() {
+        return Collections.unmodifiableSet(new HashSet<>(cancelledIds));
     }
 
     public Optional<Reservation> findConfirmedById(String reservationId) {
