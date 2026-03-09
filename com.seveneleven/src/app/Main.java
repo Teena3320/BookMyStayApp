@@ -1,11 +1,10 @@
 package app;
 
 import model.InventorySnapshot;
-import model.RoomView;
+import model.Reservation;
 import model.ReservationRequest;
-import services.BookingQueueService;
-import services.InventoryService;
-import services.SearchService;
+import model.RoomView;
+import services.*;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
@@ -16,12 +15,17 @@ import java.util.Map;
 import java.util.Scanner;
 
 /**
- * Use Case 3: Booking Request (First-Come-First-Served)
- * - Captures guest booking intentions without modifying inventory.
- * - Uses a FIFO queue to ensure fair and predictable processing order.
- * - Prevents race conditions during high‑traffic booking scenarios.
- * - Stores each request with timestamp metadata for strict chronological ordering.
- * - Allocation and room assignment are handled later in Use Case 4.
+ * Use Case 4: Reservation Confirmation & Room Allocation
+ * - Dequeues booking requests in strict FIFO order and attempts confirmation.
+ * - Performs atomic allocation: generates a unique room ID and reserves the
+ *   requested date range in one critical section to prevent double-booking.
+ * - Enforces uniqueness via a global Set of assigned room IDs and per-type mapping.
+ * - Validates date-range availability (each night in [check-in, check-out)) before confirming.
+ * - Updates inventory immediately by marking the specific dates as booked (not the entire base).
+ * - Produces an immutable Reservation record with pricing snapshot (price at confirmation),
+ *   total nights, and total cost for auditability.
+ * - On errors (unknown room type, insufficient availability, or race conditions),
+ *   returns a REJECTED reservation or leaves the request queued to avoid head-of-line blocking.
  */
 
 public class Main {
@@ -33,24 +37,25 @@ public class Main {
         InventoryService inventory = new InventoryService();
         SearchService search = new SearchService(inventory);
         BookingQueueService bookingQueue = new BookingQueueService();
-        seedDefaults(inventory); // optional seeding
+        BookingService bookingService = new BookingService();
+        seedDefaults(inventory);
 
         boolean running = true;
         while (running) {
             printMenu();
-            int choice = readInt("Choose an option (1-12): ");
+            int choice = readInt("Choose an option (1-14): ");
             switch (choice) {
                 case 1:
                     addRoomType(inventory);
                     break;
                 case 2:
-                    updateCount(inventory);
+                    updateBaseCount(inventory);
                     break;
                 case 3:
                     updatePrice(inventory);
                     break;
                 case 4:
-                    viewCounts(inventory);
+                    viewBaseCounts(inventory);
                     break;
                 case 5:
                     viewPrices(inventory);
@@ -59,13 +64,13 @@ public class Main {
                     viewSnapshot(inventory);
                     break;
                 case 7:
-                    getCount(inventory);
+                    getAvailabilityOnDate(inventory);
                     break;
                 case 8:
                     getPrice(inventory);
                     break;
                 case 9:
-                    listAvailableRooms(search);
+                    listAvailableRoomsForRange(search);
                     break;
                 case 10:
                     submitBookingRequest(inventory, bookingQueue);
@@ -74,10 +79,16 @@ public class Main {
                     viewPendingRequests(bookingQueue);
                     break;
                 case 12:
-                    running = false; // Exit
+                    confirmNextBooking(bookingQueue, bookingService, inventory);
+                    break;
+                case 13:
+                    viewConfirmedReservations(bookingService);
+                    break;
+                case 14:
+                    running = false;
                     break;
                 default:
-                    System.out.println("Invalid option. Please choose between 1 and 12.");
+                    System.out.println("Invalid option. Please choose between 1 and 14.");
             }
             if (running) {
                 System.out.println("\nPress ENTER to continue...");
@@ -88,19 +99,81 @@ public class Main {
     }
 
     private static void printMenu() {
-        System.out.println("\n=== BookMyStay Inventory, Search & Booking Queue ===");
+        System.out.println("\n=== BookMyStay (Date-based Availability) ===");
         System.out.println("1)  Add Room Type");
-        System.out.println("2)  Update Count (±delta)");
+        System.out.println("2)  Update Base Count (±delta)");
         System.out.println("3)  Update Price");
-        System.out.println("4)  View All Counts");
-        System.out.println("5)  View All Prices");
-        System.out.println("6)  View Full Snapshot");
-        System.out.println("7)  Get Count by Room Type");
+        System.out.println("4)  View Base Counts (not date-aware)");
+        System.out.println("5)  View Prices");
+        System.out.println("6)  View Base Snapshot");
+        System.out.println("7)  Get Availability by Room Type on a Date (YYYY-MM-DD)");
         System.out.println("8)  Get Price by Room Type");
-        System.out.println("9)  Search Available Rooms ");
-        System.out.println("10) Submit Booking Request ");
-        System.out.println("11) View Pending Booking Requests ");
-        System.out.println("12) Exit");
+        System.out.println("9)  Search Available Rooms for Date Range (YYYY-MM-DD to YYYY-MM-DD)");
+        System.out.println("10) Submit Booking Request (FIFO queue)");
+        System.out.println("11) View Pending Booking Requests");
+        System.out.println("12) Confirm Next Booking (allocates and blocks only requested dates)");
+        System.out.println("13) View Confirmed Reservations");
+        System.out.println("14) Exit");
+    }
+
+    // --- UC4 actions ---
+
+    private static void confirmNextBooking(BookingQueueService queue, BookingService bookingService, InventoryService inventory) {
+        Reservation reservation = bookingService.confirmNext(queue, inventory);
+        if (reservation == null) {
+            if (queue.size() == 0) {
+                System.out.println("No pending requests to process.");
+            } else {
+                System.out.println("Head request cannot be confirmed now (insufficient availability on some dates). Try later.");
+            }
+            return;
+        }
+        switch (reservation.getStatus()) {
+            case CONFIRMED -> {
+                System.out.println("\n-- Reservation Confirmed --");
+                System.out.printf("ReservationID : %s%n", reservation.getReservationId());
+                System.out.printf("RequestID     : %s%n", reservation.getRequestId());
+                System.out.printf("Guest         : %s%n", reservation.getGuestIdOrName());
+                System.out.printf("RoomType      : %s%n", reservation.getRoomType());
+                System.out.printf("RoomID        : %s%n", reservation.getRoomId());
+                System.out.printf("CheckIn       : %s%n", reservation.getCheckIn());
+                System.out.printf("CheckOut      : %s%n", reservation.getCheckOut());
+                System.out.printf("Nights        : %d%n", reservation.getNights());
+                System.out.printf("Price/Night   : %.2f%n", reservation.getPricePerNight());
+                System.out.printf("Total         : %.2f%n", reservation.getTotalCost());
+            }
+            case REJECTED -> {
+                System.out.println("\n-- Reservation Rejected --");
+                System.out.printf("RequestID     : %s%n", reservation.getRequestId());
+                System.out.printf("Guest         : %s%n", reservation.getGuestIdOrName());
+                System.out.printf("RoomType      : %s%n", reservation.getRoomType());
+                System.out.println("Reason        : See RoomID note -> " + reservation.getRoomId());
+            }
+            default -> System.out.println("Unhandled status: " + reservation.getStatus());
+        }
+    }
+
+    private static void viewConfirmedReservations(BookingService bookingService) {
+        List<Reservation> list = bookingService.listConfirmed();
+        System.out.println("\n-- Confirmed Reservations --");
+        if (list.isEmpty()) {
+            System.out.println("  (none)");
+            return;
+        }
+        System.out.printf("%-12s | %-12s | %-15s | %-10s | %-10s | %-8s | %-10s | %-10s%n",
+                "ReservationID", "RequestID", "Guest", "RoomType", "RoomID", "Nights", "Price/N", "Total");
+        System.out.println("------------+--------------+-----------------+------------+------------+----------+------------+------------");
+        for (Reservation r : list) {
+            System.out.printf("%-12s | %-12s | %-15s | %-10s | %-10s | %-8d | %-10.2f | %-10.2f%n",
+                    r.getReservationId(),
+                    r.getRequestId(),
+                    truncate(r.getGuestIdOrName(), 15),
+                    r.getRoomType(),
+                    r.getRoomId(),
+                    r.getNights(),
+                    r.getPricePerNight(),
+                    r.getTotalCost());
+        }
     }
 
     // --- UC3 actions ---
@@ -122,7 +195,7 @@ public class Main {
                     .checkOut(checkOut)
                     .build();
             bookingQueue.submit(req);
-            System.out.println("Request submitted in FIFO order. ID: " + req.getRequestId() +
+            System.out.println("Request submitted. ID: " + req.getRequestId() +
                     " | SubmittedAt: " + req.getSubmittedAt());
         } catch (IllegalArgumentException ex) {
             System.out.println("Error: " + ex.getMessage());
@@ -130,7 +203,7 @@ public class Main {
     }
 
     private static void viewPendingRequests(BookingQueueService bookingQueue) {
-        List<ReservationRequest> pending = bookingQueue.snapshotPending();
+        var pending = bookingQueue.snapshotPending();
         System.out.println("\n-- Pending Booking Requests (FIFO) --");
         if (pending.isEmpty()) {
             System.out.println("  (none)");
@@ -139,7 +212,7 @@ public class Main {
         System.out.printf("%-12s | %-15s | %-10s | %-10s | %-24s%n",
                 "RequestID", "Guest", "RoomType", "CheckIn", "SubmittedAt");
         System.out.println("------------+-----------------+------------+------------+--------------------------");
-        for (ReservationRequest r : pending) {
+        for (var r : pending) {
             System.out.printf("%-12s | %-15s | %-10s | %-10s | %-24s%n",
                     r.getRequestId(),
                     truncate(r.getGuestIdOrName(), 15),
@@ -150,57 +223,56 @@ public class Main {
         System.out.println("Total pending: " + bookingQueue.size());
     }
 
-    private static String truncate(String s, int max) {
-        if (s == null) return "";
-        if (s.length() <= max) return s;
-        return s.substring(0, max - 1) + "…";
-    }
+    // --- UC2 actions (date-aware) ---
 
-    // --- UC2 actions ---
-
-    private static void listAvailableRooms(SearchService search) {
-        System.out.println("\n-- Available Rooms (count > 0) --");
-        List<RoomView> views = search.listAvailableRooms();
-        if (views.isEmpty()) {
-            System.out.println("  No rooms currently available.");
+    private static void listAvailableRoomsForRange(SearchService search) {
+        LocalDate start = readDate("Enter start date (YYYY-MM-DD): ");
+        LocalDate end = readDate("Enter end date (YYYY-MM-DD): ");
+        if (!end.isAfter(start)) {
+            System.out.println("End date must be after start date.");
             return;
         }
-        System.out.printf("  %-12s | %-6s | %-10s%n", "RoomType", "Count", "Price");
-        System.out.println("  -------------+--------+------------");
+        System.out.println("\n-- Available Rooms for Range " + start + " to " + end + " --");
+        List<RoomView> views = search.listAvailableRooms(start, end);
+        if (views.isEmpty()) {
+            System.out.println("  No room types available for the entire range.");
+            return;
+        }
+        System.out.printf("  %-12s | %-8s | %-10s%n", "RoomType", "MinAvail", "Price");
+        System.out.println("  -------------+----------+------------");
         for (RoomView v : views) {
-            System.out.printf("  %-12s | %-6d | %-10.2f%n",
+            System.out.printf("  %-12s | %-8d | %-10.2f%n",
                     v.getRoomType(), v.getAvailableCount(), v.getPricePerNight());
         }
     }
 
-    // --- UC1 actions ---
+    // --- UC1 actions (base) ---
 
     private static void addRoomType(InventoryService inventory) {
         String type = readString("Enter room type name (e.g., Single, Double, Suite): ");
-        int count = readInt("Enter initial count (integer >= 0): ");
+        int count = readInt("Enter base count (integer >= 0): ");
         double price = readDouble("Enter price per night (number >= 0): ");
         try {
             inventory.addRoomType(type, count, price);
-            System.out.println("Added room type '" + type + "' with count=" + count + ", price=" + price);
+            System.out.println("Added room type '" + type + "' with base=" + count + ", price=" + price);
         } catch (IllegalArgumentException ex) {
             System.out.println("Error: " + ex.getMessage());
         }
     }
 
-    private static void updateCount(InventoryService inventory) {
-        String type = readString("Enter room type name to update (e.g., Single): ");
-        int delta = readInt("Enter count delta (integer; positive to add, negative to reduce): ");
+    private static void updateBaseCount(InventoryService inventory) {
+        String type = readString("Enter room type name to update base (e.g., Single): ");
+        int delta = readInt("Enter base count delta (integer; positive to add, negative to reduce): ");
         try {
             inventory.updateCount(type, delta);
-            System.out.println("Updated '" + type + "' by delta " + delta +
-                    ". New count: " + inventory.getAvailableCount(type));
+            System.out.println("Updated base for '" + type + "'. New base: " + inventory.getAvailableCount(type));
         } catch (IllegalArgumentException ex) {
             System.out.println("Error: " + ex.getMessage());
         }
     }
 
     private static void updatePrice(InventoryService inventory) {
-        String type = readString("Enter room type name to update (e.g., Double): ");
+        String type = readString("Enter room type name to update price (e.g., Double): ");
         double price = readDouble("Enter new price per night (number >= 0): ");
         try {
             inventory.updatePrice(type, price);
@@ -210,8 +282,8 @@ public class Main {
         }
     }
 
-    private static void viewCounts(InventoryService inventory) {
-        System.out.println("\n-- Room Counts --");
+    private static void viewBaseCounts(InventoryService inventory) {
+        System.out.println("\n-- Base Room Counts (not date-aware) --");
         Map<String, Integer> counts = inventory.snapshotCounts();
         if (counts.isEmpty()) {
             System.out.println("  (no room types found)");
@@ -236,7 +308,7 @@ public class Main {
 
     private static void viewSnapshot(InventoryService inventory) {
         InventorySnapshot snapshot = inventory.snapshot();
-        System.out.println("\n-- Inventory Snapshot --");
+        System.out.println("\n-- Base Inventory Snapshot --");
         System.out.println("Counts:");
         if (snapshot.getCounts().isEmpty()) {
             System.out.println("  (no room types found)");
@@ -255,11 +327,12 @@ public class Main {
         }
     }
 
-    private static void getCount(InventoryService inventory) {
-        String type = readString("Enter room type name to check count (e.g., Suite): ");
+    private static void getAvailabilityOnDate(InventoryService inventory) {
+        String type = readString("Enter room type name (e.g., Suite): ");
+        LocalDate date = readDate("Enter date (YYYY-MM-DD): ");
         try {
-            int count = inventory.getAvailableCount(type);
-            System.out.println("Available '" + type + "': " + count);
+            int avail = inventory.getAvailableOnDate(type, date);
+            System.out.println("Available '" + type + "' on " + date + " : " + avail);
         } catch (IllegalArgumentException ex) {
             System.out.println("Error: " + ex.getMessage());
         }
@@ -323,15 +396,15 @@ public class Main {
         }
     }
 
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        if (s.length() <= max) return s;
+        return s.substring(0, max - 1) + "…";
+    }
+
     private static void seedDefaults(InventoryService inventory) {
-        try {
-            inventory.addRoomType("Single", 10, 2999.00);
-        } catch (IllegalArgumentException ignored) {}
-        try {
-            inventory.addRoomType("Double", 8, 4599.50);
-        } catch (IllegalArgumentException ignored) {}
-        try {
-            inventory.addRoomType("Suite", 3, 11999.00);
-        } catch (IllegalArgumentException ignored) {}
+        try { inventory.addRoomType("Single", 10, 2999.00); } catch (IllegalArgumentException ignored) {}
+        try { inventory.addRoomType("Double", 8, 4599.50); } catch (IllegalArgumentException ignored) {}
+        try { inventory.addRoomType("Suite", 3, 11999.00); } catch (IllegalArgumentException ignored) {}
     }
 }

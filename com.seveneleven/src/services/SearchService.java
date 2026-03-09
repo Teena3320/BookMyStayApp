@@ -1,13 +1,9 @@
 package services;
 
-import model.InventorySnapshot;
 import model.RoomView;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.time.LocalDate;
+import java.util.*;
 
 public class SearchService {
 
@@ -17,29 +13,33 @@ public class SearchService {
         this.inventory = Objects.requireNonNull(inventory, "inventory");
     }
 
-    public List<RoomView> listAvailableRooms() {
-        InventorySnapshot snapshot = inventory.snapshot();
-        Map<String, Integer> counts = snapshot.getCounts();
-        Map<String, Double> prices = snapshot.getPrices();
+    public List<RoomView> listAvailableRooms(LocalDate startInclusive, LocalDate endExclusive) {
+        Objects.requireNonNull(startInclusive, "startInclusive");
+        Objects.requireNonNull(endExclusive, "endExclusive");
+        if (!endExclusive.isAfter(startInclusive)) {
+            throw new IllegalArgumentException("endExclusive must be after startInclusive");
+        }
+
+        Map<String, Integer> baseCounts = inventory.snapshotCounts();
+        Map<String, Double> prices = inventory.snapshotPrices();
 
         List<RoomView> result = new ArrayList<>();
-        for (Map.Entry<String, Integer> e : counts.entrySet()) {
-            int count = e.getValue();
-            if (count > 0) {
-                String type = e.getKey();
-                double price = prices.getOrDefault(type, 0.0d);
-                result.add(new RoomView(type, count, price));
+        for (String type : baseCounts.keySet()) {
+            int minAvail = inventory.getAvailableForRange(type, startInclusive, endExclusive);
+            if (minAvail > 0) {
+                double price = prices.getOrDefault(type, 0.0);
+                result.add(new RoomView(type, minAvail, price));
             }
         }
         result.sort(Comparator.comparing(RoomView::getRoomType, String.CASE_INSENSITIVE_ORDER));
         return result;
     }
 
-    public RoomView getRoomView(String roomType) {
-        InventorySnapshot snapshot = inventory.snapshot();
-        Integer count = snapshot.getCounts().get(roomType);
-        Double price = snapshot.getPrices().get(roomType);
-        if (count == null || price == null) return null;
-        return new RoomView(roomType, count, price);
+    public int getAvailabilityForRange(String type, LocalDate startInclusive, LocalDate endExclusive) {
+        return inventory.getAvailableForRange(type, startInclusive, endExclusive);
+    }
+    
+    public int getAvailabilityOnDate(String type, LocalDate date) {
+        return inventory.getAvailableOnDate(type, date);
     }
 }

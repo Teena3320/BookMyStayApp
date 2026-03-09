@@ -6,7 +6,7 @@ import java.util.Set;
 
 public final class RoomView {
     private final String roomType;
-    private final int availableCount;
+    private final int availableCount;     
     private final double pricePerNight;
     private final Set<String> amenities; 
 
